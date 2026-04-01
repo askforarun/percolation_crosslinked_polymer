@@ -5,7 +5,7 @@ Percolation analysis for LAMMPS data files.
 This module:
 1) Parses a LAMMPS data file into atoms, bonds, neighbor graph, and box vectors.
 2) Finds connected bond components and detects periodic wrapping via BFS image offsets.
-3) Computes a gel-like percolation criterion on the largest covalent component.
+3) Computes per-component and largest-component percolation summaries.
 4) Optionally renders a human-readable report and a component-colored data file.
 """
 
@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 import re
-import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any
@@ -23,7 +23,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GEL_FRACTION_THRESHOLD = 0.90
 
 
 @dataclass(frozen=True)
@@ -34,7 +33,7 @@ class LammpsData:
     bond_list: list[tuple[int, int, int, int]]
     neighbors: dict[int, list[int]]
     box: np.ndarray
-    atom_to_molecule: dict[int, int]
+    bond_translations: dict[tuple[int, int], np.ndarray]
 
 
 def _validate_atoms_header(header_line: str) -> None:
@@ -52,18 +51,63 @@ def _format_dim_flags(flags: np.ndarray) -> str:
     return "".join(["X" if flags[0] else "-", "Y" if flags[1] else "-", "Z" if flags[2] else "-"])
 
 
-def read_lammps_data(filename: str, include_molecules: bool | None = None) -> LammpsData:
-    """Read a LAMMPS data file and return a stable, named payload.
+def _check_translation_independent(
+    existing_basis: list[np.ndarray],
+    new_vector: np.ndarray,
+) -> bool:
+    """Return True if ``new_vector`` adds a new independent periodic direction."""
+    new_vector = np.asarray(new_vector, dtype=int)
+    if not np.any(new_vector):
+        return False
+    if len(existing_basis) >= 3:
+        return False
+    if not existing_basis:
+        return True
 
-    The return signature is always stable (a :class:`LammpsData` dataclass), regardless
-    of caller preferences. ``include_molecules`` is retained only for backward
-    compatibility and is ignored.
-    """
-    if include_molecules is not None:
-        logger.debug(
-            "read_lammps_data(include_molecules=...) is deprecated; "
-            "return shape is always stable."
-        )
+    # Only rank-increasing loop translations add a new percolation direction.
+    # For example, [3, 0, 0] is dependent if [-1, 0, 0] is already in the basis.
+    old_matrix = np.vstack([np.asarray(vec, dtype=float) for vec in existing_basis])
+    new_matrix = np.vstack([old_matrix, new_vector.astype(float)])
+    return np.linalg.matrix_rank(new_matrix) > np.linalg.matrix_rank(old_matrix)
+
+
+def _basis_axes(basis_vectors: list[np.ndarray]) -> np.ndarray:
+    """Map independent basis vectors back to x/y/z axis flags for reporting."""
+    if not basis_vectors:
+        return np.array([False, False, False], dtype=bool)
+    basis = np.vstack([np.asarray(vec, dtype=int) for vec in basis_vectors])
+    return np.any(basis != 0, axis=0)
+
+
+def _infer_bond_translation(
+    atom1_position: np.ndarray,
+    atom2_position: np.ndarray,
+    box: np.ndarray,
+) -> np.ndarray:
+    """Infer the periodic translation from atom1 to atom2 in an orthorhombic box."""
+    diff = atom2_position - atom1_position
+    return -np.round(diff / box).astype(int)
+
+
+def _build_bond_translations(
+    atom_data: dict[int, np.ndarray],
+    bond_list: list[tuple[int, int, int, int]],
+    box: np.ndarray,
+) -> dict[tuple[int, int], np.ndarray]:
+    """Build directed bond translations from local wrapped bond geometry."""
+    translations: dict[tuple[int, int], np.ndarray] = {}
+    for _bond_id, _bond_type, a1, a2 in bond_list:
+        crossing = _infer_bond_translation(atom_data[a1], atom_data[a2], box)
+        # Percolation needs a local edge translation field. Using absolute atom-image
+        # differences here can telescope around closed loops and suppress the nonzero
+        # lattice translations that define periodic percolation.
+        translations[(a1, a2)] = crossing.copy()
+        translations[(a2, a1)] = (-crossing).copy()
+    return translations
+
+
+def read_lammps_data(filename: str) -> LammpsData:
+    """Read a LAMMPS data file and return a stable, named payload."""
 
     logger.info("Reading: %s", filename)
     with open(filename) as f:
@@ -107,7 +151,7 @@ def read_lammps_data(filename: str, include_molecules: bool | None = None) -> La
     )
 
     atom_data: dict[int, np.ndarray] = {}
-    atom_to_molecule: dict[int, int] = {}
+    atom_images: dict[int, np.ndarray] = {}
     i = atoms_line + 2
     while i < len(lines):
         raw = lines[i]
@@ -123,7 +167,6 @@ def read_lammps_data(filename: str, include_molecules: bool | None = None) -> La
             )
         try:
             aid = int(parts[0])
-            mol_id = int(parts[1])
             x = float(parts[4]) - box_lo[0]
             y = float(parts[5]) - box_lo[1]
             z = float(parts[6]) - box_lo[2]
@@ -132,7 +175,16 @@ def read_lammps_data(filename: str, include_molecules: bool | None = None) -> La
                 f"Failed parsing Atoms row at line {i+1}: {raw.rstrip()!r}"
             ) from exc
         atom_data[aid] = np.array([x, y, z])
-        atom_to_molecule[aid] = mol_id
+        if len(parts) >= 10:
+            try:
+                atom_images[aid] = np.array(
+                    [int(parts[7]), int(parts[8]), int(parts[9])],
+                    dtype=int,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Failed parsing optional image flags in Atoms row at line {i+1}: {raw.rstrip()!r}"
+                ) from exc
         i += 1
 
     bond_list: list[tuple[int, int, int, int]] = []
@@ -162,13 +214,25 @@ def read_lammps_data(filename: str, include_molecules: bool | None = None) -> La
         neighbors[a2].append(a1)
         i += 1
 
+    if atom_images:
+        logger.info(
+            "Parsed image flags for %d atoms; percolation edge translations are still inferred from local wrapped bond geometry.",
+            len(atom_images),
+        )
+
+    bond_translations = _build_bond_translations(
+        atom_data=atom_data,
+        bond_list=bond_list,
+        box=box,
+    )
+
     logger.info("Atoms: %d, Bonds: %d", len(atom_data), len(bond_list))
     return LammpsData(
         atom_data=atom_data,
         bond_list=bond_list,
         neighbors=dict(neighbors),
         box=box,
-        atom_to_molecule=atom_to_molecule,
+        bond_translations=bond_translations,
     )
 
 
@@ -177,9 +241,12 @@ def analyze_percolation(
     bond_list: list[tuple[int, int, int, int]],
     neighbors: dict[int, list[int]],
     box: np.ndarray,
-    atom_to_molecule: dict[int, int] | None = None,
+    bond_translations: dict[tuple[int, int], np.ndarray] | None = None,
 ) -> dict[int, dict[str, Any]]:
-    """BFS through the bond graph and track image offsets to detect wrapping."""
+    """BFS through the bond graph using explicit edge translations to detect wrapping."""
+    if bond_translations is None:
+        bond_translations = _build_bond_translations(atom_data, bond_list, box)
+
     all_atoms = sorted(atom_data.keys())
     visited: dict[int, int] = {}
     components: dict[int, dict[str, Any]] = {}
@@ -189,10 +256,13 @@ def analyze_percolation(
         if start in visited:
             continue
 
+        # image_offset stores which periodic copy of each atom this BFS path reaches.
         image_offset = {start: np.array([0, 0, 0], dtype=int)}
         queue = deque([start])
         comp_atoms = [start]
         wrapping = {0: [], 1: [], 2: []}
+        # basis_vectors holds only the independent loop translations for this component.
+        basis_vectors: list[np.ndarray] = []
 
         while queue:
             a1 = queue.popleft()
@@ -201,8 +271,10 @@ def analyze_percolation(
 
             for a2 in neighbors.get(a1, []):
                 p2 = atom_data[a2]
-                diff = p2 - p1
-                crossing = -np.round(diff / box).astype(int)
+                crossing = bond_translations.get((a1, a2))
+                if crossing is None:
+                    crossing = _infer_bond_translation(p1, p2, box)
+                # Follow the edge translation to the periodic copy of a2 reached from a1.
                 off2_expected = off1 + crossing
 
                 if a2 not in image_offset:
@@ -210,10 +282,14 @@ def analyze_percolation(
                     queue.append(a2)
                     comp_atoms.append(a2)
                 else:
+                    # Reaching the same atom with a different offset closes a periodic loop.
+                    # delta is the translation between the two copies of that atom.
                     delta = off2_expected - image_offset[a2]
                     for dim in range(3):
                         if delta[dim] != 0:
                             wrapping[dim].append((a1, a2, int(delta[dim])))
+                    if _check_translation_independent(basis_vectors, delta):
+                        basis_vectors.append(delta.copy())
 
         for aid in comp_atoms:
             visited[aid] = component_id
@@ -221,31 +297,14 @@ def analyze_percolation(
         offsets = np.array(list(image_offset.values()))
         span = offsets.max(axis=0) - offsets.min(axis=0)
 
-        n_unique_molecules = None
-        n_intermolecular_bonds = None
-        if atom_to_molecule is not None:
-            comp_atom_set = set(comp_atoms)
-            n_unique_molecules = len(
-                {atom_to_molecule[aid] for aid in comp_atoms if aid in atom_to_molecule}
-            )
-            n_intermolecular_bonds = sum(
-                1
-                for _bid, _btype, a1, a2 in bond_list
-                if a1 in comp_atom_set
-                and a2 in comp_atom_set
-                and atom_to_molecule.get(a1) is not None
-                and atom_to_molecule.get(a2) is not None
-                and atom_to_molecule[a1] != atom_to_molecule[a2]
-            )
-
         components[component_id] = {
             "atoms": sorted(comp_atoms),
             "n_atoms": len(comp_atoms),
-            "n_unique_molecules": n_unique_molecules,
-            "n_intermolecular_bonds": n_intermolecular_bonds,
             "wrapping": wrapping,
             "offset_span": span,
-            "percolates": np.array([len(wrapping[d]) > 0 for d in range(3)]),
+            "basis_vectors": [vec.copy() for vec in basis_vectors],
+            "percolation_dim": len(basis_vectors),
+            "percolates": _basis_axes(basis_vectors),
         }
         component_id += 1
 
@@ -347,44 +406,8 @@ def write_component_type_data_file(
 
 def compute_report(
     components: dict[int, dict[str, Any]],
-    bond_list: list[tuple[int, int, int, int]],
-    gel_fraction_threshold: float = DEFAULT_GEL_FRACTION_THRESHOLD,
-    min_unique_molecules_in_largest: int = 1,
-    min_intermolecular_bonds_in_largest: int = 1,
-    crosslink_bond_ids: tuple[int, ...] = (),
-    crosslink_bond_types: tuple[int, ...] = (),
-    min_crosslink_bonds_in_largest: int = 0,
 ) -> dict[str, Any]:
     """Pure report computation with no I/O side effects."""
-    if not (0.0 <= gel_fraction_threshold <= 1.0):
-        raise ValueError(
-            f"gel_fraction_threshold must be within [0, 1], got {gel_fraction_threshold}"
-        )
-    if min_unique_molecules_in_largest < 1:
-        raise ValueError(
-            "min_unique_molecules_in_largest must be >= 1, "
-            f"got {min_unique_molecules_in_largest}"
-        )
-    if min_intermolecular_bonds_in_largest < 0:
-        raise ValueError(
-            "min_intermolecular_bonds_in_largest must be >= 0, "
-            f"got {min_intermolecular_bonds_in_largest}"
-        )
-    if min_crosslink_bonds_in_largest < 0:
-        raise ValueError(
-            "min_crosslink_bonds_in_largest must be >= 0, "
-            f"got {min_crosslink_bonds_in_largest}"
-        )
-    if (
-        min_crosslink_bonds_in_largest > 0
-        and not crosslink_bond_types
-        and not crosslink_bond_ids
-    ):
-        raise ValueError(
-            "crosslink_bond_ids or crosslink_bond_types must be provided when "
-            "min_crosslink_bonds_in_largest > 0"
-        )
-
     n_components = len(components)
     sorted_components = sorted(components.items(), key=lambda x: -x[1]["n_atoms"])
     sizes = [comp["n_atoms"] for _cid, comp in sorted_components]
@@ -401,9 +424,10 @@ def compute_report(
     total_wrapping = {0: 0, 1: 0, 2: 0}
     for cid, comp in sorted_components:
         percolates = comp["percolates"]
+        percolation_dim = comp.get("percolation_dim", int(any(percolates)))
         wrap_counts = [len(comp["wrapping"][d]) for d in range(3)]
         span = comp["offset_span"]
-        if any(percolates):
+        if percolation_dim > 0:
             n_percolating += 1
         system_percolates |= percolates
         for dim in range(3):
@@ -412,6 +436,8 @@ def compute_report(
             {
                 "id": cid,
                 "n_atoms": comp["n_atoms"],
+
+                "percolation_dim": percolation_dim,
                 "percolates": percolates,
                 "wrapping_counts": wrap_counts,
                 "offset_span": span,
@@ -422,58 +448,17 @@ def compute_report(
         largest_cid, largest_comp = sorted_components[0]
         largest_fraction = largest_comp["n_atoms"] / total_atoms
         largest_percolates = largest_comp["percolates"]
+        largest_percolation_dim = largest_comp.get(
+            "percolation_dim",
+            int(any(largest_percolates)),
+        )
         largest_component_spans_xyz = bool(all(largest_percolates))
-        largest_n_unique_molecules = largest_comp.get("n_unique_molecules")
-        largest_n_intermolecular_bonds = largest_comp.get("n_intermolecular_bonds")
-        largest_atoms_set = set(largest_comp["atoms"])
     else:
         largest_cid = None
         largest_fraction = 0.0
         largest_percolates = np.array([False, False, False])
+        largest_percolation_dim = 0
         largest_component_spans_xyz = False
-        largest_n_unique_molecules = None
-        largest_n_intermolecular_bonds = None
-        largest_atoms_set = set()
-
-    crosslink_bond_id_set = set(int(bid) for bid in crosslink_bond_ids)
-    crosslink_bond_type_set = set(int(t) for t in crosslink_bond_types)
-    largest_crosslink_bond_count = 0
-    if crosslink_bond_id_set or crosslink_bond_type_set:
-        largest_crosslink_bond_count = sum(
-            1
-            for bond_id, bond_type, a1, a2 in bond_list
-            if (
-                int(bond_id) in crosslink_bond_id_set
-                or int(bond_type) in crosslink_bond_type_set
-            )
-            and a1 in largest_atoms_set
-            and a2 in largest_atoms_set
-        )
-
-    has_required_unique_molecules = (
-        min_unique_molecules_in_largest <= 1
-        or (
-            largest_n_unique_molecules is not None
-            and largest_n_unique_molecules >= min_unique_molecules_in_largest
-        )
-    )
-    has_required_intermolecular_bonds = (
-        min_intermolecular_bonds_in_largest <= 0
-        or (
-            largest_n_intermolecular_bonds is not None
-            and largest_n_intermolecular_bonds >= min_intermolecular_bonds_in_largest
-        )
-    )
-    has_required_crosslink_bonds = (
-        largest_crosslink_bond_count >= min_crosslink_bonds_in_largest
-    )
-    gel_like_percolation_pass = bool(
-        largest_component_spans_xyz
-        and largest_fraction >= gel_fraction_threshold
-        and has_required_unique_molecules
-        and has_required_intermolecular_bonds
-        and has_required_crosslink_bonds
-    )
 
     return {
         "n_components": n_components,
@@ -489,22 +474,12 @@ def compute_report(
         "system_percolates": system_percolates,
         "total_wrapping": total_wrapping,
         "largest_component_id": largest_cid,
-        "gel_fraction": largest_fraction,
         "largest_component_fraction": largest_fraction,
+        "largest_component_percolation_dim": largest_percolation_dim,
         "largest_component_percolates": largest_percolates,
         "largest_component_spans_xyz": largest_component_spans_xyz,
-        "largest_component_unique_molecules": largest_n_unique_molecules,
-        "min_unique_molecules_in_largest": min_unique_molecules_in_largest,
-        "largest_component_intermolecular_bonds": largest_n_intermolecular_bonds,
-        "min_intermolecular_bonds_in_largest": min_intermolecular_bonds_in_largest,
-        "crosslink_bond_ids": tuple(sorted(crosslink_bond_id_set)),
-        "crosslink_bond_types": tuple(sorted(crosslink_bond_type_set)),
-        "largest_component_crosslink_bond_count": largest_crosslink_bond_count,
-        "min_crosslink_bonds_in_largest": min_crosslink_bonds_in_largest,
-        "gel_fraction_threshold": gel_fraction_threshold,
-        "gel_like_percolation_pass": gel_like_percolation_pass,
-    }
 
+    }
 
 def format_report(report: dict[str, Any]) -> list[str]:
     """Format a precomputed report dictionary for human-readable output."""
@@ -551,6 +526,7 @@ def format_report(report: dict[str, Any]) -> list[str]:
         span = comp["offset_span"]
         lines.append(
             f"  Component {comp['id']:3d}: {comp['n_atoms']:6d} atoms | "
+            f"dim={comp['percolation_dim']} | "
             f"percolates [{dims}] | "
             f"wrapping bonds X:{wrap_counts[0]} Y:{wrap_counts[1]} Z:{wrap_counts[2]} | "
             f"span X:{span[0]} Y:{span[1]} Z:{span[2]}"
@@ -580,10 +556,11 @@ def format_report(report: dict[str, Any]) -> list[str]:
     else:
         lines.append(
             f"  Largest component id: {largest_cid} "
-            f"({report['largest_size']} atoms, {report['gel_fraction'] * 100:.1f}% of system)"
+            f"({report['largest_size']} atoms, {report['largest_component_fraction'] * 100:.1f}% of system)"
         )
     lines.append(
         f"  Largest component percolation: "
+        f"dim={report['largest_component_percolation_dim']} "
         f"[{_format_dim_flags(report['largest_component_percolates'])}]"
     )
     lines.append(
@@ -591,49 +568,6 @@ def format_report(report: dict[str, Any]) -> list[str]:
         f"{'YES' if report['largest_component_spans_xyz'] else 'NO'}"
     )
     lines.append(f"  Largest component fraction: {report['largest_component_fraction']:.4f}")
-    lines.append(f"  Gel fraction: {report['gel_fraction']:.4f}")
-    unique_mols = report["largest_component_unique_molecules"]
-    lines.append(
-        "  Largest component unique molecules: "
-        f"{unique_mols if unique_mols is not None else 'N/A'}"
-    )
-    lines.append(
-        "  Required unique molecules in largest: "
-        f"{report['min_unique_molecules_in_largest']}"
-    )
-    intermol = report["largest_component_intermolecular_bonds"]
-    lines.append(
-        "  Largest component intermolecular bonds: "
-        f"{intermol if intermol is not None else 'N/A'}"
-    )
-    lines.append(
-        "  Required intermolecular bonds in largest: "
-        f"{report['min_intermolecular_bonds_in_largest']}"
-    )
-    lines.append(f"  Crosslink bond IDs considered: {list(report['crosslink_bond_ids']) or 'N/A'}")
-    lines.append(
-        f"  Crosslink bond types considered: {list(report['crosslink_bond_types']) or 'N/A'}"
-    )
-    lines.append(
-        f"  Largest component crosslink bonds: {report['largest_component_crosslink_bond_count']}"
-    )
-    lines.append(
-        f"  Required crosslink bonds in largest: {report['min_crosslink_bonds_in_largest']}"
-    )
-    lines.append(f"  Required fraction threshold: {report['gel_fraction_threshold']:.4f}")
-    lines.append("=" * 60)
-    lines.append("")
-    lines.append("GEL-LIKE PERCOLATION CRITERION")
-    lines.append("=" * 60)
-    lines.append(
-        "  Definition: largest covalent component spans X+Y+Z and exceeds fraction "
-        "threshold, optional unique-molecule threshold, optional intermolecular-bond "
-        "threshold, and optional crosslink-bond threshold"
-    )
-    lines.append(
-        f"  Gel-like percolation: "
-        f"{'YES' if report['gel_like_percolation_pass'] else 'NO'}"
-    )
     lines.append("=" * 60)
     lines.append("")
     lines.append(
@@ -646,103 +580,49 @@ def format_report(report: dict[str, Any]) -> list[str]:
     )
     return lines
 
+def _write_report_output(report_out: str, lines: list[str]) -> None:
+    """Write the human-readable report to disk."""
+    output_path = Path(report_out)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n")
+    logger.info("Wrote report file: %s", output_path)
 
 def print_report(
     components: dict[int, dict[str, Any]],
-    bond_list: list[tuple[int, int, int, int]],
-    gel_fraction_threshold: float = DEFAULT_GEL_FRACTION_THRESHOLD,
-    min_unique_molecules_in_largest: int = 1,
-    min_intermolecular_bonds_in_largest: int = 1,
-    crosslink_bond_ids: tuple[int, ...] = (),
-    crosslink_bond_types: tuple[int, ...] = (),
-    min_crosslink_bonds_in_largest: int = 0,
+    report_out: str = '',
 ) -> dict[str, Any]:
-    """Compatibility wrapper: compute report, then emit formatted lines."""
-    report = compute_report(
-        components=components,
-        bond_list=bond_list,
-        gel_fraction_threshold=gel_fraction_threshold,
-        min_unique_molecules_in_largest=min_unique_molecules_in_largest,
-        min_intermolecular_bonds_in_largest=min_intermolecular_bonds_in_largest,
-        crosslink_bond_ids=crosslink_bond_ids,
-        crosslink_bond_types=crosslink_bond_types,
-        min_crosslink_bonds_in_largest=min_crosslink_bonds_in_largest,
-    )
-    for line in format_report(report):
+    """Compute the percolation report, emit it, and optionally persist it."""
+    report = compute_report(components=components)
+    report_lines = format_report(report)
+    for line in report_lines:
         logger.info(line)
-    return report
 
+    if report_out:
+        _write_report_output(report_out, report_lines)
+    return report
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Analyze percolation from a LAMMPS data file bond network. "
-            "CLI pass/fail uses gel-like criterion based on the largest component."
+            "Analyze percolation from a LAMMPS data file bond network and print "
+            "a connected-component/percolation summary."
         )
     )
     parser.add_argument("data_file", help="LAMMPS data file")
-    parser.add_argument(
-        "--gel-fraction-threshold",
-        type=float,
-        default=DEFAULT_GEL_FRACTION_THRESHOLD,
-        help=(
-            "Largest-component fraction threshold for gel-like percolation pass "
-            f"(default: {DEFAULT_GEL_FRACTION_THRESHOLD})."
-        ),
-    )
-    parser.add_argument(
-        "--min-unique-molecules-in-largest",
-        type=int,
-        default=1,
-        help=(
-            "Minimum distinct molecule IDs required in the largest component "
-            "for gel-like percolation pass (default: 1, i.e. disabled)."
-        ),
-    )
-    parser.add_argument(
-        "--min-intermolecular-bonds-in-largest",
-        type=int,
-        default=1,
-        help=(
-            "Minimum number of intermolecular covalent bonds required in the largest "
-            "component for gel-like percolation pass (default: 1)."
-        ),
-    )
-    parser.add_argument(
-        "--crosslink-bond-ids",
-        nargs="*",
-        type=int,
-        default=[],
-        help=(
-            "Optional explicit bond IDs considered as crosslinks when applying "
-            "--min-crosslink-bonds-in-largest."
-        ),
-    )
-    parser.add_argument(
-        "--crosslink-bond-types",
-        nargs="*",
-        type=int,
-        default=[],
-        help=(
-            "Optional bond type IDs considered as crosslinks when applying "
-            "--min-crosslink-bonds-in-largest."
-        ),
-    )
-    parser.add_argument(
-        "--min-crosslink-bonds-in-largest",
-        type=int,
-        default=0,
-        help=(
-            "Optional minimum number of selected crosslink bonds required in the "
-            "largest component for gel-like percolation pass (default: 0, disabled)."
-        ),
-    )
     parser.add_argument(
         "--component-type-data-out",
         default="",
         help=(
             "Optional LAMMPS data output path where atom type is replaced by component "
             "rank (largest component -> type 1, second largest -> type 2, ...)."
+        ),
+    )
+    parser.add_argument(
+        "--report-out",
+        default="",
+        help=(
+            "Optional path to write the human-readable percolation report that is "
+            "printed to the terminal."
         ),
     )
     args = parser.parse_args()
@@ -755,17 +635,11 @@ def main() -> None:
         data.bond_list,
         data.neighbors,
         data.box,
-        atom_to_molecule=data.atom_to_molecule,
+        bond_translations=data.bond_translations,
     )
-    report = print_report(
+    print_report(
         components=components,
-        bond_list=data.bond_list,
-        gel_fraction_threshold=args.gel_fraction_threshold,
-        min_unique_molecules_in_largest=args.min_unique_molecules_in_largest,
-        min_intermolecular_bonds_in_largest=args.min_intermolecular_bonds_in_largest,
-        crosslink_bond_ids=tuple(args.crosslink_bond_ids),
-        crosslink_bond_types=tuple(args.crosslink_bond_types),
-        min_crosslink_bonds_in_largest=args.min_crosslink_bonds_in_largest,
+        report_out=args.report_out,
     )
 
     if args.component_type_data_out:
@@ -774,31 +648,6 @@ def main() -> None:
             output_file=args.component_type_data_out,
             components=components,
         )
-
-    if not report["gel_like_percolation_pass"]:
-        logger.error("ERROR: Gel-like percolation criterion failed.")
-        logger.error(
-            "Largest component spans: [%s]",
-            _format_dim_flags(report["largest_component_percolates"]),
-        )
-        logger.error(
-            "Gel fraction: %.4f (threshold %.4f)",
-            report["gel_fraction"],
-            report["gel_fraction_threshold"],
-        )
-        logger.error(
-            "Largest component intermolecular bonds: %s (required >= %d)",
-            report["largest_component_intermolecular_bonds"],
-            report["min_intermolecular_bonds_in_largest"],
-        )
-        logger.error(
-            "Largest component crosslink bonds: %d (required >= %d, ids=%s, types=%s)",
-            report["largest_component_crosslink_bond_count"],
-            report["min_crosslink_bonds_in_largest"],
-            list(report["crosslink_bond_ids"]),
-            list(report["crosslink_bond_types"]),
-        )
-        sys.exit(1)
 
 
 if __name__ == "__main__":
