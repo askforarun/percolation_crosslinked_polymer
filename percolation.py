@@ -522,13 +522,11 @@ def format_report(report: dict[str, Any]) -> list[str]:
     for comp in report["component_summaries"]:
         perc = comp["percolates"]
         dims = _format_dim_flags(perc)
-        wrap_counts = comp["wrapping_counts"]
         span = comp["offset_span"]
         lines.append(
             f"  Component {comp['id']:3d}: {comp['n_atoms']:6d} atoms | "
             f"dim={comp['percolation_dim']} | "
             f"percolates [{dims}] | "
-            f"wrapping bonds X:{wrap_counts[0]} Y:{wrap_counts[1]} Z:{wrap_counts[2]} | "
             f"span X:{span[0]} Y:{span[1]} Z:{span[2]}"
         )
     lines.append("")
@@ -536,12 +534,9 @@ def format_report(report: dict[str, Any]) -> list[str]:
     lines.append("SYSTEM-LEVEL PERCOLATION SUMMARY")
     lines.append("=" * 60)
     system_percolates = report["system_percolates"]
-    total_wrapping = report["total_wrapping"]
     for dim, label in enumerate(["X", "Y", "Z"]):
         status = "YES" if system_percolates[dim] else "NO"
-        lines.append(
-            f"  Percolates in {label}: {status}  ({total_wrapping[dim]} wrapping bonds)"
-        )
+        lines.append(f"  Percolates in {label}: {status}")
     lines.append("")
     lines.append(
         f"  Fully percolated (X+Y+Z): {'YES' if all(system_percolates) else 'NO'}"

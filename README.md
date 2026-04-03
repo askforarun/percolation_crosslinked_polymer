@@ -213,14 +213,14 @@ Component size distribution:
   Atoms outside largest: 0
 
 Per-component percolation:
-  Component   0:  86310 atoms | dim=3 | percolates [XYZ] | wrapping bonds X:410 Y:470 Z:470 | span X:8 Y:10 Z:7
+  Component   0:  86310 atoms | dim=3 | percolates [XYZ] | span X:8 Y:10 Z:7
 
 ============================================================
 SYSTEM-LEVEL PERCOLATION SUMMARY
 ============================================================
-  Percolates in X: YES  (410 wrapping bonds)
-  Percolates in Y: YES  (470 wrapping bonds)
-  Percolates in Z: YES  (470 wrapping bonds)
+  Percolates in X: YES
+  Percolates in Y: YES
+  Percolates in Z: YES
 
   Fully percolated (X+Y+Z): YES
 ============================================================
