@@ -114,6 +114,11 @@ This gives a `percolation_dim` value:
 
 The script also reports `percolates` as axis flags (`X`, `Y`, `Z`) for easier reading.
 
+Important caveat:
+- this is a **bond-graph percolation** test under PBC
+- it does **not** currently distinguish a single self-periodic polymer chain from a network-like intermolecular gel
+- so one polymer chain that connects to itself across periodic boundaries can still be reported as percolating
+
 ### Bond Translations
 
 The current code builds **explicit per-bond translation vectors** from the local wrapped bond geometry.
@@ -275,6 +280,7 @@ Current limitations include:
 - LAMMPS `atom_style full` assumption
 - no bundled trajectory reader
 - no bundled LAMMPS examples inside this repository itself
+- no built-in filter to separate self-periodic single-chain percolation from network-like intermolecular gel percolation
 
 ## References
 
