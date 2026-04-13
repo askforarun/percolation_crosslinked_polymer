@@ -97,8 +97,7 @@ The percolation logic implemented here follows the same core idea as the percola
 
 ### Periodic Percolation Detection
 
-The script does **not** define percolation as "I saw one wrapped bond".
-That is too weak.
+A single wrapped bond straddling a periodic boundary is not, by itself, sufficient evidence of percolation.
 
 Instead, it:
 1. walks through the bond graph
