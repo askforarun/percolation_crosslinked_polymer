@@ -2,6 +2,8 @@
 
 Python utility for analyzing bond-network percolation in LAMMPS `data` files through a CLI workflow built around explicit periodic bond translations and basis-vector percolation detection.
 
+If you use this repository, please cite both the Zenodo software record for this codebase and the original paper that describes the percolation algorithm.
+
 The core percolation logic follows the same main idea as Mattia Livraghi, Kevin Höllring, Christian R. Wick, David M. Smith, and Ana-Sunčana Smith, *An Exact Algorithm to Detect the Percolation Transition in Molecular Dynamics Simulations of Cross-Linking Polymer Networks*, *Journal of Chemical Theory and Computation* (2021), DOI: [10.1021/acs.jctc.1c00423](https://doi.org/10.1021/acs.jctc.1c00423), and the reference implementation in [`puls-group/percolation-analyzer`](https://github.com/puls-group/percolation-analyzer).
 
 ## Key Features
