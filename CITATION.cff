@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: >-
   If you use this software or the associated percolation algorithm, please cite
-  both the software repository and the paper below.
+  both the Zenodo software DOI and the paper below.
 title: percolation_repo
 version: 0.1.0
 date-released: 2026-04-19
@@ -19,7 +19,8 @@ preferred-citation:
   version: 0.1.0
   date-released: 2026-04-19
   repository-code: https://github.com/askforarun/percolation_crosslinked_polymer
-  url: https://github.com/askforarun/percolation_crosslinked_polymer
+  doi: 10.5281/zenodo.19653094
+  url: https://doi.org/10.5281/zenodo.19653094
 references:
   - type: article
     title: An Exact Algorithm to Detect the Percolation Transition in Molecular Dynamics Simulations of Cross-Linking Polymer Networks
