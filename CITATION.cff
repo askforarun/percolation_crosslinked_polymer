@@ -3,12 +3,13 @@ message: >-
   If you use this software or the associated percolation algorithm, please cite
   the paper below.
 title: percolation_repo
-version: 0.0.0
+version: 0.1.0
 date-released: 2026-04-19
 repository-code: https://github.com/askforarun/percolation_crosslinked_polymer
 url: https://github.com/askforarun/percolation_crosslinked_polymer
 authors:
   - name: Arun
+    email: askforarun@gmail.com
 preferred-citation:
   type: article
   title: An Exact Algorithm to Detect the Percolation Transition in Molecular Dynamics Simulations of Cross-Linking Polymer Networks
